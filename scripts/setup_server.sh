@@ -14,39 +14,47 @@ echo "HYDRA 复现 - 服务器初始化"
 echo "项目目录: $PROJECT_DIR"
 echo "============================================================"
 
-# ---------- 0. 安装 uv ----------
-echo ""
-echo "[0/4] 检查 uv..."
-
-if ! command -v uv &> /dev/null; then
-    echo "  未检测到 uv，正在安装..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-    if ! command -v uv &> /dev/null; then
-        echo "  uv 安装失败，尝试 pip 方式..."
-    fi
-fi
-
-if command -v uv &> /dev/null; then
-    echo "  uv 版本: $(uv --version)"
-fi
-
 # ---------- 1. 安装 Python 依赖 ----------
 echo ""
 echo "[1/4] 安装 Python 依赖..."
 
-if command -v uv &> /dev/null; then
-    echo "  使用 uv sync..."
-    uv sync --dev
-else
-    echo "  使用 pip..."
-    pip install -e ".[dev]" 2>/dev/null || pip install -e .
+# 确保 uv 在 PATH 中
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+if ! command -v uv &> /dev/null; then
+    echo "  uv 未安装，正在安装..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 fi
 
-# 验证关键包
-python3 -c "import torch; import transformers; import sklearn; print('  依赖安装成功')" || {
-    echo "  依赖安装失败，请手动检查"
-    exit 1
+if command -v uv &> /dev/null; then
+    echo "  uv 版本: $(uv --version)"
+    echo "  使用 uv sync 安装依赖..."
+    uv sync
+else
+    echo "  uv 安装失败，使用 pip..."
+    pip install torch transformers scikit-learn numpy tqdm pandas
+fi
+
+# 确定正确的 python 路径
+if [ -f ".venv/bin/python" ]; then
+    PYTHON=".venv/bin/python"
+elif command -v uv &> /dev/null; then
+    PYTHON="uv run python"
+else
+    PYTHON="python3"
+fi
+
+echo "  使用 Python: $PYTHON"
+
+# 验证依赖
+$PYTHON -c "import torch; import transformers; import sklearn; print('  依赖安装成功')" || {
+    echo "  依赖安装失败，尝试 pip 安装..."
+    pip install torch transformers scikit-learn numpy tqdm pandas
+    $PYTHON -c "import torch; import transformers; import sklearn; print('  依赖安装成功')" || {
+        echo "  依赖安装仍然失败，请手动检查"
+        exit 1
+    }
 }
 
 # ---------- 2. 下载 WOS46985 数据集 ----------
@@ -94,7 +102,6 @@ else
     fi
 fi
 
-# 验证
 echo "  数据文件检查:"
 for f in X.txt YL1.txt YL2.txt Y.txt; do
     if [ -f "$DATA_DIR/$f" ]; then
@@ -116,21 +123,21 @@ else
     mkdir -p "$MODEL_DIR"
     echo "  从 HuggingFace 下载 allenai/scibert_scivocab_uncased..."
 
-    # 尝试直接下载，如果失败则用镜像
-    HF_ENDPOINT="${HF_ENDPOINT:-}"
-    
-    python3 -c "
-import os
-os.environ.setdefault('HF_ENDPOINT', '$HF_ENDPOINT')
+    DOWNLOAD_OK=false
+
+    # 尝试直接下载
+    $PYTHON -c "
 from transformers import AutoModel, AutoTokenizer
 model = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
 tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
 model.save_pretrained('$MODEL_DIR')
 tokenizer.save_pretrained('$MODEL_DIR')
 print('  模型下载完成')
-" || {
+" && DOWNLOAD_OK=true
+
+    if [ "$DOWNLOAD_OK" = false ]; then
         echo "  直接下载失败，尝试 HuggingFace 镜像..."
-        HF_ENDPOINT="https://hf-mirror.com" python3 -c "
+        HF_ENDPOINT="https://hf-mirror.com" $PYTHON -c "
 import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 from transformers import AutoModel, AutoTokenizer
@@ -139,27 +146,29 @@ tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
 model.save_pretrained('$MODEL_DIR')
 tokenizer.save_pretrained('$MODEL_DIR')
 print('  模型下载完成 (通过镜像)')
-" || {
-            echo ""
-            echo "  ============================================================"
-            echo "  模型下载失败！请手动操作："
-            echo "  方式1: 设置 HF_ENDPOINT 环境变量后重试:"
-            echo "         HF_ENDPOINT=https://hf-mirror.com bash scripts/setup_server.sh"
-            echo "  方式2: 从本地 Mac 传输:"
-            echo "         scp -r pretrained_models/scibert/ user@server:$PROJECT_DIR/pretrained_models/"
-            echo "  方式3: 用 huggingface-cli 下载:"
-            echo "         huggingface-cli download allenai/scibert_scivocab_uncased --local-dir $MODEL_DIR"
-            echo "  ============================================================"
-            exit 1
-        }
-    }
+" && DOWNLOAD_OK=true
+    fi
+
+    if [ "$DOWNLOAD_OK" = false ]; then
+        echo ""
+        echo "  ============================================================"
+        echo "  模型下载失败！请手动操作："
+        echo "  方式1: 设置环境变量后重试:"
+        echo "         HF_ENDPOINT=https://hf-mirror.com bash scripts/setup_server.sh"
+        echo "  方式2: 从本地 Mac 传输:"
+        echo "         scp -r pretrained_models/scibert/ user@server:$PROJECT_DIR/pretrained_models/"
+        echo "  方式3: 用 huggingface-cli 下载:"
+        echo "         huggingface-cli download allenai/scibert_scivocab_uncased --local-dir $MODEL_DIR"
+        echo "  ============================================================"
+        exit 1
+    fi
 fi
 
 # ---------- 4. 环境验证 ----------
 echo ""
 echo "[4/4] 环境验证..."
 
-python3 << 'PYCHECK'
+$PYTHON << 'PYCHECK'
 import torch
 import sys
 sys.path.insert(0, '.')
@@ -188,7 +197,6 @@ model = HYDRA(label_dims, hier_info, 'pretrained_models/scibert')
 params = sum(p.numel() for p in model.parameters())
 print(f"  模型参数: {params:,}")
 
-import torch
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 x = torch.randint(0, 30000, (2, 32), device=device)
