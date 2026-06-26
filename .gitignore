@@ -1,0 +1,24 @@
+# Data and models (large files, download on server)
+/data/
+/pretrained_models/
+
+# Results and logs
+/results/
+/logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+
+# Not needed on server
+9rw3vkcfy4-2.zip
+selected_htc_baselines/
+main.py
+scripts/convert_wos_official.py
+scripts/convert_wos_raw.py
+scripts/preprocess_wos.py
+uv.lock

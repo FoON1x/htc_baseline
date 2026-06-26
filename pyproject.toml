@@ -1,0 +1,14 @@
+[project]
+name = "htc"
+version = "0.1.0"
+description = "HYDRA baseline reproduction for hierarchical text classification on WOS46985"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "scikit-learn>=1.5.0",
+    "numpy>=1.26.0",
+    "tqdm>=4.66.0",
+    "pandas>=2.2.0",
+]
