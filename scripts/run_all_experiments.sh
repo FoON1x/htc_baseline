@@ -1,29 +1,20 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # HYDRA 复现 - 全量实验脚本
-# 
-# 实验设计：
-#   3 种架构 x 5 个种子 = 15 次实验
-#   - HYDRA Local Heads Only (seeds: 42,1,2,3,4)
-#   - HYDRA Local + Global   (seeds: 42,1,2,3,4)
-#   - HYDRA Local + Nested   (seeds: 42,1,2,3,4)
 #
-# 预估用时（4090 + fp16）：
-#   - 每 epoch ~2-3 min，约 10-15 epoch 收敛
-#   - 每次实验 ~25-45 min
-#   - 15 次实验总计 ~6-11 小时
+# 3 架构 x 5 种子 = 15 次实验
+# 预估用时 (4090+fp16): 6-11 小时
 #
-# 用法：bash scripts/run_all_experiments.sh
+# 用法: bash scripts/run_all_experiments.sh
 # ============================================================
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-# 确保 uv 在 PATH 中
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
-# 确定 python 命令
+# 确定 python
 if [ -f ".venv/bin/python" ]; then
     PYTHON=".venv/bin/python"
 elif command -v uv &> /dev/null; then
@@ -45,73 +36,52 @@ WARMUP=500
 PATIENCE=5
 FP16_FLAG=""
 
-# 检测 GPU 类型，自动启用 fp16
+# 检测 CUDA → 自动开 fp16
 if $PYTHON -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
     FP16_FLAG="--fp16"
     GPU_NAME=$($PYTHON -c "import torch; print(torch.cuda.get_device_name(0))")
-    echo "检测到 CUDA GPU: $GPU_NAME，启用 fp16"
-elif $PYTHON -c "import torch; assert torch.backends.mps.is_available()" 2>/dev/null; then
-    echo "检测到 Apple MPS，不使用 fp16"
+    echo "CUDA: $GPU_NAME, fp16 已启用"
 else
-    echo "警告：未检测到 GPU，将使用 CPU（速度很慢）"
+    echo "CUDA 不可用，fp16 未启用"
 fi
 
-# 检查数据
-if [ ! -f "$DATA_DIR/X.txt" ]; then
-    echo "错误：数据未找到 ($DATA_DIR/X.txt)"
-    echo "请先运行: bash scripts/setup_server.sh"
-    exit 1
-fi
-
-# 检查模型
-if [ ! -f "$MODEL_NAME/config.json" ]; then
-    echo "错误：模型未找到 ($MODEL_NAME/config.json)"
-    echo "请先运行: bash scripts/setup_server.sh"
-    exit 1
-fi
+# 前置检查
+[ -f "$DATA_DIR/X.txt" ] || { echo "错误: 数据缺失，先运行 bash scripts/setup_server.sh"; exit 1; }
+[ -f "$MODEL_NAME/config.json" ] || { echo "错误: 模型缺失，先运行 bash scripts/setup_server.sh"; exit 1; }
 
 # ---------- 日志 ----------
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-MASTER_LOG="$LOG_DIR/experiment_${TIMESTAMP}.log"
+TS=$(date +%Y%m%d_%H%M%S)
+MASTER_LOG="$LOG_DIR/experiment_${TS}.log"
 
-log() {
-    echo "$@" | tee -a "$MASTER_LOG"
-}
+log() { echo "$@" | tee -a "$MASTER_LOG"; }
 
 log "============================================================"
-log "HYDRA 复现 - 全量实验"
-log "开始时间: $(date)"
-log "Python: $PYTHON"
-log "配置: 3 架构 x 5 种子 = 15 次实验"
-log "日志文件: $MASTER_LOG"
+log "HYDRA 全量实验 | $(date)"
+log "Python: $PYTHON | 3 架构 x 5 种子 = 15 次"
 log "============================================================"
 
-# ---------- 运行实验 ----------
+# ---------- 运行 ----------
 ARCHS=("local" "local_global" "local_nested")
 TOTAL=15
-COMPLETED=0
-FAILED=0
-START_ALL=$(date +%s)
+DONE=0
+FAIL=0
+T0=$(date +%s)
 
 for ARCH in "${ARCHS[@]}"; do
     log ""
-    log "============================================================"
-    log "架构: HYDRA $ARCH"
-    log "============================================================"
-    
+    log "====== HYDRA $ARCH ======"
+
     IFS=',' read -ra SEED_ARR <<< "$SEEDS"
     for SEED in "${SEED_ARR[@]}"; do
-        COMPLETED=$((COMPLETED + 1))
+        DONE=$((DONE + 1))
         log ""
-        log "[$COMPLETED/$TOTAL] HYDRA $ARCH seed=$SEED"
-        log "  开始: $(date)"
-        
-        RUN_START=$(date +%s)
-        
-        RUN_LOG="$LOG_DIR/hydra_${ARCH}_seed${SEED}_${TIMESTAMP}.log"
-        
+        log "[$DONE/$TOTAL] $ARCH seed=$SEED @ $(date)"
+
+        T1=$(date +%s)
+        RUN_LOG="$LOG_DIR/hydra_${ARCH}_seed${SEED}_${TS}.log"
+
         if $PYTHON scripts/train_hydra.py \
             --data_dir "$DATA_DIR" \
             --output_dir "$OUTPUT_DIR" \
@@ -130,50 +100,42 @@ for ARCH in "${ARCHS[@]}"; do
             --seed "$SEED" \
             $FP16_FLAG \
             2>&1 | tee "$RUN_LOG"; then
-            
-            RUN_END=$(date +%s)
-            RUN_TIME=$((RUN_END - RUN_START))
-            log "  完成: $(date) (用时: $((RUN_TIME/60))min)"
-            
-            # 提取关键指标
+
+            DT=$(( $(date +%s) - T1 ))
+            log "  完成 (用时: $((DT/60))min)"
+
+            # 提取结果
             RESULT_DIR=$(ls -dt "$OUTPUT_DIR"/hydra_${ARCH}_seed${SEED}_* 2>/dev/null | head -1)
             if [ -n "$RESULT_DIR" ] && [ -f "$RESULT_DIR/test_metrics.json" ]; then
                 log "  结果:"
                 $PYTHON -c "
 import json
 m = json.load(open('$RESULT_DIR/test_metrics.json'))
-print(f'    Child Micro-F1: {m.get(\"child_micro_f1_argmax\", 0)*100:.2f}')
-print(f'    Child Macro-F1: {m.get(\"child_macro_f1_argmax\", 0)*100:.2f}')
-print(f'    Parent Micro-F1: {m.get(\"parent_micro_f1_argmax\", 0)*100:.2f}')
-print(f'    Hier Consistency: {m.get(\"hierarchical_consistency\", 0)*100:.2f}%')
-print(f'    Best Epoch: {m.get(\"best_epoch\", \"?\")}')
+print(f'    Child Micro-F1: {m.get(\"child_micro_f1_argmax\",0)*100:.2f}')
+print(f'    Child Macro-F1: {m.get(\"child_macro_f1_argmax\",0)*100:.2f}')
+print(f'    Parent Micro-F1: {m.get(\"parent_micro_f1_argmax\",0)*100:.2f}')
+print(f'    Hier Cons: {m.get(\"hierarchical_consistency\",0)*100:.2f}%')
+print(f'    Best Epoch: {m.get(\"best_epoch\",\"?\")}')
 " 2>/dev/null | tee -a "$MASTER_LOG"
             fi
         else
-            FAILED=$((FAILED + 1))
-            log "  失败! 详见 $RUN_LOG"
+            FAIL=$((FAIL + 1))
+            log "  ✗ 失败! 详见 $RUN_LOG"
         fi
     done
 done
 
 # ---------- 汇总 ----------
-END_ALL=$(date +%s)
-TOTAL_TIME=$((END_ALL - START_ALL))
-
+TOTAL_T=$(( $(date +%s) - T0 ))
 log ""
 log "============================================================"
-log "全部实验完成"
+log "全部完成 | 总用时 $((TOTAL_T/3600))h$((TOTAL_T%3600/60))min | 成功 $((TOTAL-FAIL))/$TOTAL"
 log "============================================================"
-log "总用时: $((TOTAL_TIME/3600))h $((TOTAL_TIME%3600/60))min"
-log "成功: $((TOTAL - FAILED)) / $TOTAL"
-log "失败: $FAILED"
-log ""
 
-# 生成汇总报告
+log ""
 log "生成结果汇总..."
 $PYTHON scripts/summarize_results.py "$OUTPUT_DIR" 2>&1 | tee -a "$MASTER_LOG"
 
 log ""
 log "汇总报告: docs/experiment_results_summary.md"
 log "详细日志: $LOG_DIR/"
-log "完成时间: $(date)"
