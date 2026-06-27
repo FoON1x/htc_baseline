@@ -1,0 +1,18 @@
+{
+  "data_dir": "data/wos_raw/WOS46985",
+  "max_length": 256,
+  "model_name": "pretrained_models/scibert",
+  "architecture": "local",
+  "pooling": "cls",
+  "project_embedding": true,
+  "batch_size": 32,
+  "num_epochs": 30,
+  "learning_rate": 3.5e-05,
+  "warmup_steps": 500,
+  "early_stopping_patience": 5,
+  "threshold": 0.5,
+  "loss_alpha": 1.0,
+  "seed": 42,
+  "seeds": null,
+  "output_dir": "results"
+}

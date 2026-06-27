@@ -2,10 +2,6 @@
 /data/
 /pretrained_models/
 
-# Results and logs
-/results/
-/logs/
-
 # Python
 __pycache__/
 *.pyc
