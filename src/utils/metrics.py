@@ -114,6 +114,10 @@ def compute_single_label_accuracy(y_true: np.ndarray, y_pred_probs: np.ndarray,
 
     metrics[f'{level_name}micro_f1_argmax'] = f1_score(
         y_true, pred_onehot, average='micro', zero_division=0)
+    metrics[f'{level_name}micro_precision_argmax'] = precision_score(
+        y_true, pred_onehot, average='micro', zero_division=0)
+    metrics[f'{level_name}micro_recall_argmax'] = recall_score(
+        y_true, pred_onehot, average='micro', zero_division=0)
     metrics[f'{level_name}macro_f1_argmax'] = f1_score(
         y_true, pred_onehot, average='macro', zero_division=0)
     metrics[f'{level_name}macro_precision_argmax'] = precision_score(

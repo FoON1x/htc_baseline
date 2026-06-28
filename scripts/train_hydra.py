@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
@@ -73,6 +73,54 @@ def local_and_global_loss(level_outputs, unified_output, labels,
         total_loss = total_loss + alpha * unified_loss
 
     return total_loss
+
+
+def binary_metrics(y_true, y_pred, prefix):
+    """Compute official HYDRA-style threshold metrics for multi-hot labels."""
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+    return {
+        f'{prefix}accuracy': accuracy_score(y_true, y_pred),
+        f'{prefix}precision': precision_score(
+            y_true, y_pred, average='micro', zero_division=0),
+        f'{prefix}recall': recall_score(
+            y_true, y_pred, average='micro', zero_division=0),
+        f'{prefix}micro_f1': f1_score(
+            y_true, y_pred, average='micro', zero_division=0),
+        f'{prefix}macro_f1': f1_score(
+            y_true, y_pred, average='macro', zero_division=0),
+        f'{prefix}macro_precision': precision_score(
+            y_true, y_pred, average='macro', zero_division=0),
+        f'{prefix}macro_recall': recall_score(
+            y_true, y_pred, average='macro', zero_division=0),
+        f'{prefix}avg_true_labels': float(y_true.sum(axis=1).mean()),
+        f'{prefix}avg_pred_labels': float(y_pred.sum(axis=1).mean()),
+    }
+
+
+def add_prefixed_metrics(target, source, prefix):
+    for key, value in source.items():
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            target[f'{prefix}{key}'] = float(value)
+
+
+def official_selection_key(architecture):
+    """Metric used by the official HYDRA implementation for early stopping."""
+    if architecture in ('local_global', 'local_nested'):
+        return 'unified_macro_f1'
+    return 'training_mode_overall_macro_f1'
+
+
+def resolve_selection_key(config):
+    if config.selection_metric == 'official':
+        return official_selection_key(config.architecture)
+    return config.selection_metric
+
+
+def resolve_padding_strategy(config):
+    if config.padding_strategy == 'none':
+        return False
+    return config.padding_strategy
 
 
 def train_one_epoch(model, train_loader, optimizer, scheduler, device, config,
@@ -124,6 +172,7 @@ def evaluate(model, data_loader, device, hierarchy_info, threshold=0.5,
     model.eval()
     all_parent_probs, all_child_probs = [], []
     all_parent_true, all_child_true = [], []
+    unified_probs, unified_true = [], []
 
     for batch in tqdm(data_loader, desc="Evaluating", leave=False):
         input_ids = batch['input_ids'].to(device)
@@ -132,14 +181,17 @@ def evaluate(model, data_loader, device, hierarchy_info, threshold=0.5,
 
         if scaler is not None and device.type == 'cuda':
             with torch.amp.autocast('cuda'):
-                level_outputs, _ = model(input_ids, attention_mask)
+                level_outputs, unified_output = model(input_ids, attention_mask)
         else:
-            level_outputs, _ = model(input_ids, attention_mask)
+            level_outputs, unified_output = model(input_ids, attention_mask)
 
         all_parent_probs.append(torch.sigmoid(level_outputs[0]).cpu().float().numpy())
         all_child_probs.append(torch.sigmoid(level_outputs[1]).cpu().float().numpy())
         all_parent_true.append(labels[0].numpy())
         all_child_true.append(labels[1].numpy())
+        if unified_output is not None:
+            unified_probs.append(torch.sigmoid(unified_output).cpu().float().numpy())
+            unified_true.append(torch.cat(labels, dim=1).numpy())
 
     parent_probs = np.concatenate(all_parent_probs, axis=0)
     child_probs = np.concatenate(all_child_probs, axis=0)
@@ -149,7 +201,7 @@ def evaluate(model, data_loader, device, hierarchy_info, threshold=0.5,
     parent_preds = (parent_probs > threshold).astype(int)
     child_preds = (child_probs > threshold).astype(int)
 
-    return evaluate_all(
+    metrics = evaluate_all(
         parent_true=parent_true, child_true=child_true,
         parent_preds=parent_preds, child_preds=child_preds,
         parent_probs=parent_probs, child_probs=child_probs,
@@ -157,9 +209,53 @@ def evaluate(model, data_loader, device, hierarchy_info, threshold=0.5,
         threshold=threshold,
     )
 
+    # Official HYDRA naming: "training_mode" is the direct thresholded local-head
+    # output. Keep flat aliases for easy summary-table generation.
+    add_prefixed_metrics(metrics, binary_metrics(parent_true, parent_preds, ''),
+                         'training_mode_level_0_')
+    add_prefixed_metrics(metrics, binary_metrics(child_true, child_preds, ''),
+                         'training_mode_level_1_')
+    all_true = np.concatenate([parent_true, child_true], axis=1)
+    all_train_preds = np.concatenate([parent_preds, child_preds], axis=1)
+    add_prefixed_metrics(metrics, binary_metrics(all_true, all_train_preds, ''),
+                         'training_mode_overall_')
+
+    # Official implementation also reports greedy constrained inference. It is
+    # not the paper's main mode, but recording it makes the reproduction auditable.
+    inf_parent_preds = parent_preds.copy()
+    inf_child_preds = np.zeros_like(child_preds)
+    parent_child_map = hierarchy_info.parent_child_map.get(1, {})
+    for i in range(child_preds.shape[0]):
+        parent_ids = np.where(inf_parent_preds[i] == 1)[0]
+        allowed_children = []
+        for parent_id in parent_ids:
+            allowed_children.extend(parent_child_map.get(parent_id, []))
+        if allowed_children:
+            inf_child_preds[i, allowed_children] = child_preds[i, allowed_children]
+
+    add_prefixed_metrics(metrics, binary_metrics(parent_true, inf_parent_preds, ''),
+                         'inference_mode_level_0_')
+    add_prefixed_metrics(metrics, binary_metrics(child_true, inf_child_preds, ''),
+                         'inference_mode_level_1_')
+    all_inf_preds = np.concatenate([inf_parent_preds, inf_child_preds], axis=1)
+    add_prefixed_metrics(metrics, binary_metrics(all_true, all_inf_preds, ''),
+                         'inference_mode_overall_')
+
+    if unified_probs:
+        unified_probs_arr = np.concatenate(unified_probs, axis=0)
+        unified_true_arr = np.concatenate(unified_true, axis=0)
+        unified_preds = (unified_probs_arr > threshold).astype(int)
+        add_prefixed_metrics(metrics, binary_metrics(unified_true_arr, unified_preds, ''),
+                             'unified_')
+
+    metrics['eval_threshold'] = float(threshold)
+    return metrics
+
 
 def run_experiment(config):
     device = get_device()
+    config.selection_metric_resolved = resolve_selection_key(config)
+    config.padding_strategy_resolved = resolve_padding_strategy(config)
 
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -176,14 +272,26 @@ def run_experiment(config):
 
     logger.info(f"Run: {run_name}")
     logger.info(f"Architecture: {config.architecture} | Encoder: {config.model_name}")
-    logger.info(f"Max length: {config.max_length} | Batch size: {config.batch_size}")
+    logger.info(
+        f"Max length: {config.max_length} | Batch size: {config.batch_size} | "
+        f"Padding: {config.padding_strategy_resolved}")
+    logger.info(f"Selection metric: {config.selection_metric_resolved}")
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     train_dataset, val_dataset, test_dataset, hierarchy_info = get_wos_datasets(
-        data_dir=config.data_dir, tokenizer=tokenizer, max_length=config.max_length)
+        data_dir=config.data_dir, tokenizer=tokenizer, max_length=config.max_length,
+        padding=config.padding_strategy_resolved)
+
+    if config.limit_train_samples:
+        train_dataset = Subset(train_dataset, range(min(config.limit_train_samples, len(train_dataset))))
+        logger.info(f"Debug limit: train samples={len(train_dataset)}")
+    if config.limit_eval_samples:
+        val_dataset = Subset(val_dataset, range(min(config.limit_eval_samples, len(val_dataset))))
+        test_dataset = Subset(test_dataset, range(min(config.limit_eval_samples, len(test_dataset))))
+        logger.info(f"Debug limit: val/test samples={len(val_dataset)}/{len(test_dataset)}")
 
     num_levels = len(hierarchy_info.label_dims)
     collator = HTCDataCollator(tokenizer, num_levels)
@@ -237,7 +345,7 @@ def run_experiment(config):
         optimizer, num_warmup_steps=config.warmup_steps,
         num_training_steps=num_training_steps)
 
-    best_val_metric = 0.0
+    best_val_metric = -1.0
     best_epoch = 0
     patience_counter = 0
     history = []
@@ -260,17 +368,22 @@ def run_experiment(config):
         val_metrics['epoch_time'] = time.time() - epoch_start
         history.append(val_metrics)
 
-        current_metric = val_metrics.get('child_micro_f1_argmax',
-                         val_metrics.get('child_micro_f1', 0))
+        current_metric = val_metrics.get(config.selection_metric_resolved)
+        if current_metric is None:
+            available = ', '.join(sorted(val_metrics.keys()))
+            raise KeyError(
+                f"Selection metric '{config.selection_metric_resolved}' not found. "
+                f"Available metrics: {available}")
+        val_metrics['selection_metric'] = config.selection_metric_resolved
+        val_metrics['selection_metric_value'] = float(current_metric)
 
         logger.info(
             f"Epoch {epoch+1}/{config.num_epochs} | "
             f"Loss: {train_loss:.4f} | Time: {val_metrics['epoch_time']:.0f}s | "
-            f"Parent Acc: {val_metrics['parent_acc_argmax']:.4f} | "
-            f"Child Acc: {val_metrics['child_acc_argmax']:.4f} | "
-            f"Child Micro-F1: {val_metrics['child_micro_f1_argmax']:.4f} | "
-            f"Child Macro-F1: {val_metrics['child_macro_f1_argmax']:.4f} | "
-            f"Hier Cons: {val_metrics['hierarchical_consistency']:.4f}")
+            f"Selection {config.selection_metric_resolved}: {current_metric:.4f} | "
+            f"Training Overall Micro-F1: {val_metrics['training_mode_overall_micro_f1']:.4f} | "
+            f"Training Overall Macro-F1: {val_metrics['training_mode_overall_macro_f1']:.4f} | "
+            f"Child Argmax Micro-F1: {val_metrics['child_micro_f1_argmax']:.4f}")
 
         if current_metric > best_val_metric:
             best_val_metric = current_metric
@@ -279,7 +392,7 @@ def run_experiment(config):
             torch.save(model.state_dict(), output_dir / 'best_model.pt')
             with open(output_dir / 'best_val_metrics.json', 'w') as f:
                 json.dump(val_metrics, f, indent=2)
-            logger.info(f"  -> New best (child Micro-F1: {current_metric:.4f})")
+            logger.info(f"  -> New best ({config.selection_metric_resolved}: {current_metric:.4f})")
         else:
             patience_counter += 1
             logger.info(f"  -> No improvement ({patience_counter}/{config.early_stopping_patience})")
@@ -298,6 +411,9 @@ def run_experiment(config):
     test_metrics = evaluate(model, test_loader, device, hierarchy_info,
                             config.threshold, scaler)
     test_metrics['best_epoch'] = best_epoch
+    test_metrics['best_val_metric'] = float(best_val_metric)
+    test_metrics['selection_metric'] = config.selection_metric_resolved
+    test_metrics['protocol'] = 'strict_hydra_scibert_official_metrics'
     test_metrics['training_time_seconds'] = training_time
     test_metrics['total_params'] = total_params
 
@@ -323,6 +439,13 @@ def main():
     parser.add_argument('--data_dir', type=str,
                         default='data/wos_raw/WOS46985')
     parser.add_argument('--max_length', type=int, default=256)
+    parser.add_argument('--padding_strategy', type=str, default='none',
+                        choices=['none', 'max_length'],
+                        help="Tokenizer padding strategy. Use max_length for strict official HYDRA reproduction.")
+    parser.add_argument('--limit_train_samples', type=int, default=0,
+                        help='Debug only: limit train samples when > 0.')
+    parser.add_argument('--limit_eval_samples', type=int, default=0,
+                        help='Debug only: limit val/test samples when > 0.')
 
     # Model
     parser.add_argument('--model_name', type=str, default='pretrained_models/scibert')
@@ -341,6 +464,10 @@ def main():
     parser.add_argument('--early_stopping_patience', type=int, default=5)
     parser.add_argument('--threshold', type=float, default=0.5)
     parser.add_argument('--loss_alpha', type=float, default=1.0)
+    parser.add_argument('--selection_metric', type=str, default='official',
+                        help=("Metric used for early stopping. Use 'official' to match "
+                              "HYDRA: local=training_mode_overall_macro_f1, "
+                              "local_global/local_nested=unified_macro_f1."))
     parser.add_argument('--fp16', action='store_true', default=False,
                         help='Use fp16 mixed precision (CUDA only)')
 

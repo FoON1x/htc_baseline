@@ -149,7 +149,8 @@ class WOSDataset(Dataset):
 
     def __init__(self, texts: List[str], yl1_labels: List[int],
                  y_labels: List[int], num_parents: int, num_children: int,
-                 tokenizer: PreTrainedTokenizer, max_length: int = 256):
+                 tokenizer: PreTrainedTokenizer, max_length: int = 256,
+                 padding: str = False):
         self.texts = texts
         self.yl1_labels = yl1_labels
         self.y_labels = y_labels
@@ -157,6 +158,7 @@ class WOSDataset(Dataset):
         self.num_children = num_children
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.padding = padding
 
     def __len__(self):
         return len(self.texts)
@@ -167,6 +169,7 @@ class WOSDataset(Dataset):
             text,
             add_special_tokens=True,
             max_length=self.max_length,
+            padding=self.padding,
             truncation=True,
             return_tensors=None,
         )
@@ -221,7 +224,8 @@ class HTCDataCollator:
 
 
 def get_wos_datasets(data_dir: str, tokenizer: PreTrainedTokenizer,
-                     max_length: int = 256) -> Tuple[WOSDataset, WOSDataset, WOSDataset, HierarchyInfo]:
+                     max_length: int = 256,
+                     padding: str = False) -> Tuple[WOSDataset, WOSDataset, WOSDataset, HierarchyInfo]:
     """Load train, val, test datasets for WOS46985 from original txt files."""
     if os.path.exists(os.path.join(data_dir, 'X.txt')):
         raw_dir = data_dir
@@ -247,10 +251,10 @@ def get_wos_datasets(data_dir: str, tokenizer: PreTrainedTokenizer,
     logger.info(f"Split: train={len(train_texts)}, val={len(val_texts)}, test={len(test_texts)}")
 
     train_dataset = WOSDataset(train_texts, train_yl1, train_y,
-                               num_parents, num_children, tokenizer, max_length)
+                               num_parents, num_children, tokenizer, max_length, padding)
     val_dataset = WOSDataset(val_texts, val_yl1, val_y,
-                             num_parents, num_children, tokenizer, max_length)
+                             num_parents, num_children, tokenizer, max_length, padding)
     test_dataset = WOSDataset(test_texts, test_yl1, test_y,
-                              num_parents, num_children, tokenizer, max_length)
+                              num_parents, num_children, tokenizer, max_length, padding)
 
     return train_dataset, val_dataset, test_dataset, hierarchy_info
